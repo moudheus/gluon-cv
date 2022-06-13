@@ -17,6 +17,34 @@ from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs, LRSequential, LRScheduler, split_and_load
 from gluoncv.data.sampler import SplitSampler, ShuffleSplitSampler
 
+### Marc
+
+from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, f1_score
+
+def tostr(x):
+    return ' '.join([str(v) for v in x])
+
+def print_metrics(val_preds, logger):
+    labels, scores, preds = [], [], []
+    for p in val_preds:
+        labels.append(p[0][0].asnumpy())
+        scores.append(p[1][0].asnumpy()[:, 1])
+        preds.append(np.argmax(p[1][0].asnumpy(), 1))
+    labels, scores, preds = np.concatenate(labels), np.concatenate(scores), np.concatenate(preds)
+
+    logger.info(tostr(labels))
+    logger.info(tostr(preds))
+    
+    logger.info('precision {:.3f} recall {:.3f} f1 {:.3f} auc-roc {:.3f} auc-pr {:.3f}'.format(
+        precision_score(labels, preds),
+        recall_score(labels, preds),
+        f1_score(labels, preds),
+        roc_auc_score(labels, scores), 
+        average_precision_score(labels, scores),
+    ))
+
+###     
+
 # CLI
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a model for video action recognition.')
@@ -275,6 +303,7 @@ def get_data_loader(opt, batch_size, num_workers, logger, kvstore=None):
 
     return train_data, val_data, batch_fn
 
+
 def main():
     opt = parse_args()
 
@@ -358,15 +387,17 @@ def main():
     optimizer_params['lr_scheduler'] = lr_scheduler
 
     train_metric = mx.metric.Accuracy()
-    acc_top1 = mx.metric.Accuracy()
-    acc_top5 = mx.metric.TopKAccuracy(5)
+    metric1 = mx.metric.Accuracy()
+    metric2 = mx.metric.F1()
 
+    
     def test(ctx, val_data, kvstore=None):
-        acc_top1.reset()
-        acc_top5.reset()
+        metric1.reset()
+        metric2.reset()
         L = gluon.loss.SoftmaxCrossEntropyLoss()
         num_test_iter = len(val_data)
         val_loss_epoch = 0
+        val_preds = []
         for i, batch in enumerate(val_data):
             data, label = batch_fn(batch, ctx)
             outputs = []
@@ -375,38 +406,41 @@ def main():
                 pred = net(X.astype(opt.dtype, copy=False))
                 outputs.append(pred)
 
+            val_preds.append([label, outputs])
+                        
             loss = [L(yhat, y.astype(opt.dtype, copy=False)) for yhat, y in zip(outputs, label)]
 
-            acc_top1.update(label, outputs)
-            acc_top5.update(label, outputs)
+            metric1.update(label, outputs)
+            metric2.update(label, outputs)
 
             val_loss_epoch += sum([l.mean().asscalar() for l in loss]) / len(loss)
 
             if opt.log_interval and not (i+1) % opt.log_interval:
-                _, top1 = acc_top1.get()
-                _, top5 = acc_top5.get()
-                logger.info('Batch [%04d]/[%04d]: acc-top1=%f acc-top5=%f' % (i, num_test_iter, top1*100, top5*100))
-
-        _, top1 = acc_top1.get()
-        _, top5 = acc_top5.get()
+                _, m1 = metric1.get()
+                _, m2 = metric2.get()
+                logger.info('Batch [%04d]/[%04d]: metric1=%f metric2=%f' % (i, num_test_iter, m1*100, m2*100))
+                           
+        _, m1 = metric1.get()
+        _, m2 = metric2.get()
         val_loss = val_loss_epoch / num_test_iter
 
         if kvstore is not None:
-            top1_nd = nd.zeros(1)
-            top5_nd = nd.zeros(1)
+            metric1_nd = nd.zeros(1)
+            metric2_nd = nd.zeros(1)
             val_loss_nd = nd.zeros(1)
-            kvstore.push(111111, nd.array(np.array([top1])))
-            kvstore.pull(111111, out=top1_nd)
-            kvstore.push(555555, nd.array(np.array([top5])))
-            kvstore.pull(555555, out=top5_nd)
+            kvstore.push(111111, nd.array(np.array([metric1])))
+            kvstore.pull(111111, out=metric1_nd)
+            kvstore.push(555555, nd.array(np.array([metric2])))
+            kvstore.pull(555555, out=metric2_nd)
             kvstore.push(999999, nd.array(np.array([val_loss])))
             kvstore.pull(999999, out=val_loss_nd)
-            top1 = top1_nd.asnumpy() / kvstore.num_workers
-            top5 = top5_nd.asnumpy() / kvstore.num_workers
+            m1 = metric1_nd.asnumpy() / kvstore.num_workers
+            m2 = metric2_nd.asnumpy() / kvstore.num_workers
             val_loss = val_loss_nd.asnumpy() / kvstore.num_workers
 
-        return (top1, top5, val_loss)
+        return (m1, m2, val_loss, val_preds)
 
+    
     def train(ctx):
         if isinstance(ctx, mx.Context):
             ctx = [ctx]
@@ -499,7 +533,7 @@ def main():
                 train_loss_epoch += train_loss_iter
 
                 train_metric_name, train_metric_score = train_metric.get()
-                sw.add_scalar(tag='train_acc_top1_iter', value=train_metric_score*100, global_step=epoch * num_train_iter + i)
+                sw.add_scalar(tag='train_metric_iter', value=train_metric_score*100, global_step=epoch * num_train_iter + i)
                 sw.add_scalar(tag='train_loss_iter', value=train_loss_iter, global_step=epoch * num_train_iter + i)
                 sw.add_scalar(tag='learning_rate_iter', value=trainer.learning_rate, global_step=epoch * num_train_iter + i)
 
@@ -524,16 +558,18 @@ def main():
                     kv.init(999999, nd.zeros(1))
 
                 if opt.kvstore is not None:
-                    acc_top1_val, acc_top5_val, loss_val = test(ctx, val_data, kv)
+                    metric1_val, metric2_val, loss_val, val_preds = test(ctx, val_data, kv)
                 else:
-                    acc_top1_val, acc_top5_val, loss_val = test(ctx, val_data)
+                    metric1_val, metric2_val, loss_val, val_preds = test(ctx, val_data)
 
-                logger.info('[Epoch %03d] validation: acc-top1=%f acc-top5=%f loss=%f' % (epoch, acc_top1_val*100, acc_top5_val*100, loss_val))
+                logger.info('[Epoch %03d] validation: metric1=%f metric2=%f loss=%f' % (epoch, metric1_val*100, metric2_val*100, loss_val))
                 sw.add_scalar(tag='val_loss_epoch', value=loss_val, global_step=epoch)
-                sw.add_scalar(tag='val_acc_top1_epoch', value=acc_top1_val*100, global_step=epoch)
+                sw.add_scalar(tag='val_metric1_epoch', value=metric1_val*100, global_step=epoch)
 
-                if acc_top1_val > best_val_score:
-                    best_val_score = acc_top1_val
+                print_metrics(val_preds, logger)
+                
+                if metric1_val > best_val_score:
+                    best_val_score = metric1_val
                     net.save_parameters('%s/%.4f-%s-%s-%03d-best.params'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
                     trainer.save_states('%s/%.4f-%s-%s-%03d-best.states'%(opt.save_dir, best_val_score, opt.dataset, model_name, epoch))
                 else:
