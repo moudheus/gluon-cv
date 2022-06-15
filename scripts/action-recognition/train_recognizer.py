@@ -10,12 +10,76 @@ from mxnet.gluon import nn
 from mxnet.gluon.data.vision import transforms
 from mxboard import SummaryWriter
 from mxnet.contrib import amp
+import random
 
 from gluoncv.data.transforms import video
 from gluoncv.data import UCF101, Kinetics400, SomethingSomethingV2, HMDB51, VideoClsCustom
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs, LRSequential, LRScheduler, split_and_load
 from gluoncv.data.sampler import SplitSampler, ShuffleSplitSampler
+from mxnet.gluon import Block
+
+
+### Vignesh
+class CustomVideoTrainTransform(Block):
+    """
+    Custom video transform based on the VideoTransformV3 class of gluoncv. 
+    The default implementation of slow fast networks by facebook uses the 
+    V3 transformation style as implemented by gluoncv. 
+
+    However the transformation fails at the random jitter transform step. This class
+    is a copy of the VideoGroupTrainTransformV3 class without the jitter transform.
+    """
+    def __init__(self, crop_size, min_size, max_size,
+                 mean, std, prob=0.5, max_intensity=255.0):
+        super(CustomVideoTrainTransform, self).__init__()
+
+        from gluoncv.utils.filesystem import try_import_cv2
+        self.cv2 = try_import_cv2()
+        self.height = crop_size[0]
+        self.width = crop_size[1]
+        self.min_size = min_size
+        self.max_size = max_size
+        self.mean = np.asarray(mean).reshape((len(mean), 1, 1))
+        self.std = np.asarray(std).reshape((len(std), 1, 1))
+        self.prob = prob
+        self.max_intensity = max_intensity
+
+    def forward(self, clips):
+        h, w, _ = clips[0].shape
+
+        # step 1: random short side scale jittering
+        # size = int(round(np.random.uniform(self.min_size, self.max_size)))
+        # new_w = size
+        # new_h = size
+        # if w < h:
+            # new_h = int(math.floor((float(h) / w) * size))
+        # else:
+            # new_w = int(math.floor((float(w) / h) * size))
+
+        # step 2: random crop
+        new_h = h; new_w = w
+        h_off = 0
+        if new_h > self.height:
+            h_off = int(np.random.randint(0, new_h - self.height))
+        w_off = 0
+        if new_w > self.width:
+            w_off = int(np.random.randint(0, new_w - self.width))
+
+        # step 3: random horizontal flip
+        is_flip = random.random() < self.prob
+
+        new_clips = []
+        for cur_img in clips:
+            scale_img = self.cv2.resize(cur_img, (new_w, new_h))
+            crop_img = scale_img[h_off:h_off+self.height, w_off:w_off+self.width, :]
+            if is_flip:
+                flip_img = np.flip(crop_img, axis=1)
+            else:
+                flip_img = crop_img
+            tensor_img = np.transpose(flip_img, axes=(2, 0, 1)) / self.max_intensity
+            new_clips.append((tensor_img - self.mean) / self.std)
+        return new_clips
 
 ### Marc
 
@@ -231,6 +295,14 @@ def get_data_loader(opt, batch_size, num_workers, logger, kvstore=None):
                                                            mean=default_mean, std=default_std)
         transform_test = video.VideoGroupValTransformV2(crop_size=(input_size, input_size), short_side=opt.new_height,
                                                         mean=default_mean, std=default_std)
+
+    elif opt.data_aug == 'custom':
+        logger.info("Using the custom video group transformation")
+        transform_train = CustomVideoTrainTransform(crop_size=(input_size, input_size), min_size=opt.new_height, max_size=opt.new_width,
+                                                           mean=default_mean, std=default_std)
+        transform_test = video.VideoGroupValTransform(size=input_size,
+                                                      mean=default_mean, std=default_std)
+
     else:
         logger.info('Data augmentation %s is not supported yet.' % (opt.data_aug))
 
