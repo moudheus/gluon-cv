@@ -14,6 +14,24 @@ from gluoncv.data import Kinetics400Attr, UCF101Attr, SomethingSomethingV2Attr, 
 from gluoncv.data.transforms import video
 from gluoncv.model_zoo import get_model
 from gluoncv.utils import makedirs
+from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, f1_score
+
+
+### Marc/Vignesh
+def tostr(x):
+    return ' '.join([str(v) for v in x])
+
+def print_metrics(inf_data, logger):
+    (preds, labels) = inf_data
+    
+    logger.info(tostr(labels))
+    logger.info(tostr(preds))
+    
+    logger.info('precision {:.3f} recall {:.3f} f1 {:.3f}'.format(
+        precision_score(labels, preds),
+        recall_score(labels, preds),
+        f1_score(labels, preds),
+    ))
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Make predictions on your own videos.')
@@ -213,9 +231,13 @@ def main():
                                  lazy_init=True)
 
     start_time = time.time()
+    preds = []
+    labels = []
     for vid, vline in enumerate(data_list):
         video_path = vline.split()[0]
         video_name = video_path.split('/')[-1]
+        label = vline.split()[-1].strip(' \n')
+        label = int(label)
         if opt.need_root:
             video_path = os.path.join(opt.data_dir, video_path)
         video_data = read_data(opt, video_path, transform_test, video_utils)
@@ -229,6 +251,8 @@ def main():
             preds_file = '%s_%s_preds.npy' % (model_name, video_name)
             np.save(os.path.join(opt.save_dir, preds_file), pred_label)
 
+        preds.append(pred_label)
+        labels.append(label)
         # Try to report a text label instead of the number.
         if classes:
             pred_label = classes[pred_label]
@@ -236,6 +260,7 @@ def main():
         logger.info('%04d/%04d: %s is predicted to class %s' % (vid, len(data_list), video_name, pred_label))
 
     end_time = time.time()
+    print_metrics((preds, labels), logger)
     logger.info('Total inference time is %4.2f minutes' % ((end_time - start_time) / 60))
 
 if __name__ == '__main__':
